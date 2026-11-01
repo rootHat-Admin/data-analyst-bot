@@ -1,13 +1,19 @@
+
 from google import genai
 from config import GEMINI_API_KEY
 
 
 MODEL_NAME = "gemini-3.5-flash-lite"
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-
 
 def explain_analysis(report: dict) -> str:
+
+    if not GEMINI_API_KEY or not GEMINI_API_KEY.strip():
+        raise ValueError(
+            "GEMINI_API_KEY is missing. AI analysis is disabled."
+        )
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
     prompt = f"""
 You are a professional business data analyst.

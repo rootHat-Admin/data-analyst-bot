@@ -2,6 +2,7 @@
 import os
 import re
 import html
+import uuid
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -17,7 +18,8 @@ from reportlab.platypus import (
 def create_pdf_report(report: dict, ai_explanation: str) -> str:
     os.makedirs("reports", exist_ok=True)
 
-    file_path = "reports/analysis_report.pdf"
+    unique_id = uuid.uuid4().hex
+    file_path = f"reports/analysis_report_{unique_id}.pdf"
 
     document = SimpleDocTemplate(
         file_path,

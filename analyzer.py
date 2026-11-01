@@ -2,16 +2,44 @@
 import pandas as pd
 
 
+MAX_ROWS = 100_000
+MAX_COLUMNS = 100
+
+
 def analyze_csv(file_path: str) -> dict:
+
+    # Check the number of columns before loading the full dataset.
+    header = pd.read_csv(
+        file_path,
+        sep=None,
+        engine="python",
+        encoding="utf-8-sig",
+        nrows=0
+    )
+
+    if len(header.columns) > MAX_COLUMNS:
+        raise ValueError(
+            f"CSV contains too many columns. "
+            f"Maximum allowed: {MAX_COLUMNS}."
+        )
+
+    # Read only one row above the limit to detect oversized files.
     df = pd.read_csv(
         file_path,
         sep=None,
         engine="python",
-        encoding="utf-8-sig"
+        encoding="utf-8-sig",
+        nrows=MAX_ROWS + 1
     )
 
     if df.empty:
         raise ValueError("The CSV file is empty.")
+
+    if len(df) > MAX_ROWS:
+        raise ValueError(
+            f"CSV contains too many rows. "
+            f"Maximum allowed: {MAX_ROWS}."
+        )
 
     missing_values = int(df.isna().sum().sum())
     duplicate_rows = int(df.duplicated().sum())
@@ -78,8 +106,9 @@ def analyze_csv(file_path: str) -> dict:
             change = ((last - first) / abs(first)) * 100
 
             insights.append(
-                f"{column}: changed by {change:.2f}% "
-                "from the first to the last observation."
+                f"{column}: the last observed value was "
+                f"{change:.2f}% different from the first observed value. "
+                "This comparison does not necessarily indicate a trend."
             )
 
     return {

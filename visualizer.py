@@ -1,5 +1,6 @@
 
 import os
+import uuid
 
 import pandas as pd
 import matplotlib
@@ -55,9 +56,12 @@ def create_charts(file_path: str, numeric_columns: list) -> list:
 
     fig.tight_layout()
 
-    chart_path = "charts/combined_chart.png"
+    unique_id = uuid.uuid4().hex
+    chart_path = f"charts/chart_{unique_id}.png"
 
-    fig.savefig(chart_path, dpi=120)
-    plt.close(fig)
+    try:
+        fig.savefig(chart_path, dpi=120)
+    finally:
+        plt.close(fig)
 
     return [chart_path]
