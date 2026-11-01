@@ -16,6 +16,7 @@ from reportlab.platypus import (
 
 
 def create_pdf_report(report: dict, ai_explanation: str) -> str:
+
     os.makedirs("reports", exist_ok=True)
 
     unique_id = uuid.uuid4().hex
@@ -27,7 +28,7 @@ def create_pdf_report(report: dict, ai_explanation: str) -> str:
         rightMargin=50,
         leftMargin=50,
         topMargin=50,
-        bottomMargin=50
+        bottomMargin=50,
     )
 
     styles = getSampleStyleSheet()
@@ -38,7 +39,7 @@ def create_pdf_report(report: dict, ai_explanation: str) -> str:
         fontSize=22,
         textColor=colors.HexColor("#17365D"),
         alignment=TA_CENTER,
-        spaceAfter=20
+        spaceAfter=20,
     )
 
     heading_style = ParagraphStyle(
@@ -47,7 +48,7 @@ def create_pdf_report(report: dict, ai_explanation: str) -> str:
         fontSize=14,
         textColor=colors.HexColor("#24527A"),
         spaceBefore=12,
-        spaceAfter=8
+        spaceAfter=8,
     )
 
     normal_style = ParagraphStyle(
@@ -55,12 +56,13 @@ def create_pdf_report(report: dict, ai_explanation: str) -> str:
         parent=styles["Normal"],
         fontSize=10,
         leading=15,
-        spaceAfter=5
+        spaceAfter=5,
     )
 
     story = []
 
-    # Main title
+    # MAIN TITLE
+
     story.append(
         Paragraph("DATA ANALYST REPORT", title_style)
     )
@@ -69,13 +71,14 @@ def create_pdf_report(report: dict, ai_explanation: str) -> str:
         Paragraph(
             f"Rows: {report['rows']} | "
             f"Columns: {report['columns']}",
-            normal_style
+            normal_style,
         )
     )
 
     story.append(Spacer(1, 15))
 
-    # Data quality
+    # DATA QUALITY
+
     story.append(
         Paragraph("DATA QUALITY", heading_style)
     )
@@ -86,75 +89,261 @@ def create_pdf_report(report: dict, ai_explanation: str) -> str:
         Paragraph(
             f"Missing values: {quality['missing_values']}<br/>"
             f"Duplicate rows: {quality['duplicate_rows']}",
-            normal_style
+            normal_style,
         )
     )
 
-    # Anomaly detection
+    # ANOMALY DETECTION
+
     story.append(
         Paragraph("ANOMALY DETECTION", heading_style)
     )
 
-    found_outliers = False
+    outliers = report.get("outliers", {})
 
-    for column, values in report["outliers"].items():
-        if values:
-            found_outliers = True
+    statistical_total = 0
+    business_total = 0
+
+    for info in outliers.values():
+        statistical_total += info.get(
+            "statistical", {}
+        ).get("count", 0)
+
+        business_total += info.get(
+            "business_rules", {}
+        ).get("count", 0)
+
+    story.append(
+        Paragraph(
+            f"Statistical outliers: {statistical_total}<br/>"
+            f"Business rule violations: {business_total}<br/>"
+            f"Total flagged values: "
+            f"{statistical_total + business_total}",
+            normal_style,
+        )
+    )
+
+    # STATISTICAL OUTLIERS
+
+    story.append(
+        Paragraph("STATISTICAL OUTLIERS", heading_style)
+    )
+
+    found_statistical = False
+
+    for column, info in outliers.items():
+
+        statistical = info.get("statistical", {})
+        count = statistical.get("count", 0)
+
+        if count <= 0:
+            continue
+
+        found_statistical = True
+        sample = statistical.get("sample", [])
+
+        sample_text = ", ".join(
+            f"row {item['row']}: {item['value']}"
+            for item in sample
+        )
+
+        remaining = count - len(sample)
+
+        line = (
+            f"<b>{html.escape(str(column))}:</b> "
+            f"{count} unusual value(s)."
+        )
+
+        if sample_text:
+            line += (
+                f" Examples: {html.escape(sample_text)}"
+            )
+
+        if remaining > 0:
+            line += f" And {remaining} more."
+
+        story.append(
+            Paragraph(line, normal_style)
+        )
+
+    if not found_statistical:
+        story.append(
+            Paragraph(
+                "No statistical outliers detected.",
+                normal_style,
+            )
+        )
+
+    # BUSINESS RULE VIOLATIONS
+
+    story.append(
+        Paragraph(
+            "BUSINESS RULE VIOLATIONS",
+            heading_style,
+        )
+    )
+
+    found_business = False
+
+    for column, info in outliers.items():
+
+        business = info.get("business_rules", {})
+        count = business.get("count", 0)
+
+        if count <= 0:
+            continue
+
+        found_business = True
+        sample = business.get("sample", [])
+
+        sample_text = ", ".join(
+            f"row {item['row']}: {item['value']}"
+            for item in sample
+        )
+
+        remaining = count - len(sample)
+
+        line = (
+            f"<b>{html.escape(str(column))}:</b> "
+            f"{count} violation(s)."
+        )
+
+        if sample_text:
+            line += (
+                f" Examples: {html.escape(sample_text)}"
+            )
+
+        if remaining > 0:
+            line += f" And {remaining} more."
+
+        story.append(
+            Paragraph(line, normal_style)
+        )
+
+    if not found_business:
+        story.append(
+            Paragraph(
+                "No business rule violations detected.",
+                normal_style,
+            )
+        )
+
+    # CALCULATION ERRORS
+
+    story.append(
+        Paragraph(
+            "CALCULATION ERRORS",
+            heading_style,
+        )
+    )
+
+    calculation_errors = report.get(
+        "calculation_errors", {}
+    )
+
+    total_calculation_errors = sum(
+        info.get("count", 0)
+        for info in calculation_errors.values()
+    )
+
+    story.append(
+        Paragraph(
+            f"Total calculation errors: "
+            f"{total_calculation_errors}",
+            normal_style,
+        )
+    )
+
+    if calculation_errors:
+
+        for column, info in calculation_errors.items():
+
+            count = info.get("count", 0)
 
             story.append(
                 Paragraph(
                     f"<b>{html.escape(str(column))}:</b> "
-                    f"{html.escape(str(values))}",
-                    normal_style
+                    f"{count} error(s)",
+                    normal_style,
                 )
             )
 
-    if not found_outliers:
+            for item in info.get("sample", []):
+
+                row = item["row"]
+                actual = item["actual"]
+                expected = item["expected"]
+
+                story.append(
+                    Paragraph(
+                        f"Row {row}: "
+                        f"Actual = {actual:.2f}; "
+                        f"Expected = {expected:.2f}",
+                        normal_style,
+                    )
+                )
+
+    else:
         story.append(
-            Paragraph("No anomalies detected.", normal_style)
+            Paragraph(
+                "No calculation errors detected.",
+                normal_style,
+            )
         )
 
     story.append(Spacer(1, 10))
 
-    # AI analysis
+    # AI ANALYSIS
+
     story.append(
         Paragraph("AI ANALYSIS", heading_style)
     )
 
     for line in ai_explanation.splitlines():
+
         line = line.strip()
 
         if not line:
             continue
 
-        # Convert Markdown headings
-        if line.startswith("## "):
-            heading = html.escape(line[3:])
+        if line.startswith("#"):
+            heading_text = line.lstrip("#").strip()
 
             story.append(
-                Paragraph(heading, heading_style)
+                Paragraph(
+                    html.escape(heading_text),
+                    heading_style,
+                )
             )
             continue
 
-        # Escape HTML characters
+        # Escape HTML before applying Markdown formatting.
         line = html.escape(line)
 
-        # Convert Markdown bold text
+        # Markdown bold
         line = re.sub(
-            r"\*\*(.*?)\*\*",
+            r"\*\*(.+?)\*\*",
             r"<b>\1</b>",
-            line
+            line,
         )
 
-        # Convert Markdown bullet points
-        if line.startswith("- "):
+        # Markdown italic
+        line = re.sub(
+            r"(?<!\*)\*([^*]+)\*(?!\*)",
+            r"<i>\1</i>",
+            line,
+        )
+
+        # Markdown bullet points
+        if line.startswith("- ") or line.startswith("* "):
             line = "&#8226; " + line[2:]
 
         story.append(
             Paragraph(line, normal_style)
         )
 
-    # Generate PDF
+    # GENERATE PDF
+
     document.build(story)
 
     return file_path

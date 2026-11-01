@@ -4,17 +4,18 @@ import pandas as pd
 
 MAX_ROWS = 100_000
 MAX_COLUMNS = 100
+OUTLIER_SAMPLE_SIZE = 10
+CALCULATION_TOLERANCE = 0.02
 
 
 def analyze_csv(file_path: str) -> dict:
 
-    # Check the number of columns before loading the full dataset.
     header = pd.read_csv(
         file_path,
         sep=None,
         engine="python",
         encoding="utf-8-sig",
-        nrows=0
+        nrows=0,
     )
 
     if len(header.columns) > MAX_COLUMNS:
@@ -23,13 +24,12 @@ def analyze_csv(file_path: str) -> dict:
             f"Maximum allowed: {MAX_COLUMNS}."
         )
 
-    # Read only one row above the limit to detect oversized files.
     df = pd.read_csv(
         file_path,
         sep=None,
         engine="python",
         encoding="utf-8-sig",
-        nrows=MAX_ROWS + 1
+        nrows=MAX_ROWS + 1,
     )
 
     if df.empty:
@@ -59,57 +59,292 @@ def analyze_csv(file_path: str) -> dict:
         }
 
         if column in numeric_columns:
-            column_stats.update({
-                "mean": float(df[column].mean()),
-                "median": float(df[column].median()),
-                "min": float(df[column].min()),
-                "max": float(df[column].max()),
-            })
+            series = df[column].dropna()
+
+            if not series.empty:
+                column_stats.update({
+                    "mean": float(series.mean()),
+                    "median": float(series.median()),
+                    "min": float(series.min()),
+                    "max": float(series.max()),
+                })
 
         statistics[column] = column_stats
 
     outliers = {}
 
+    calculation_errors = {}
+
+    def save_anomalies(column, mask, category):
+        positions = mask[mask].index
+
+        if len(positions) == 0:
+            return
+
+        sample = [
+            {
+                "row": int(index) + 2,
+                "value": float(df.loc[index, column]),
+            }
+            for index in positions[:OUTLIER_SAMPLE_SIZE]
+        ]
+
+        outliers.setdefault(column, {
+            "statistical": {
+                "count": 0,
+                "sample": [],
+            },
+            "business_rules": {
+                "count": 0,
+                "sample": [],
+            },
+        })
+
+        outliers[column][category] = {
+            "count": int(len(positions)),
+            "sample": sample,
+        }
+
+    # ------------------------------------------
+    # STATISTICAL OUTLIER DETECTION
+    # ------------------------------------------
+
+    rule_based_columns = {
+        "customer_age",
+        "quantity",
+        "discount_percent",
+        "delivery_days",
+        "inventory_stock",
+        "stock_quantity",
+    }
+
+    financial_columns = {
+        "unit_price",
+        "total_revenue",
+        "cost_per_unit",
+        "total_cost",
+        "profit",
+    }
+
+    category_column = next(
+        (
+            column
+            for column in df.columns
+            if str(column).strip().lower()
+            in {"product_category", "category"}
+        ),
+        None,
+    )
+
     for column in numeric_columns:
+
+        normalized_column = str(column).strip().lower()
+
+        if normalized_column in rule_based_columns:
+            continue
+
         series = df[column].dropna()
 
         if len(series) < 4:
             continue
 
-        Q1 = series.quantile(0.25)
-        Q3 = series.quantile(0.75)
+        if (
+            normalized_column in financial_columns
+            and category_column is not None
+        ):
 
-        IQR = Q3 - Q1
+            combined_mask = pd.Series(
+                False,
+                index=df.index,
+            )
 
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
+            grouped = df.groupby(
+                category_column,
+                dropna=True,
+            )
 
-        unusual_values = series[
-            (series < lower_bound) |
-            (series > upper_bound)
-        ]
+            for _, group in grouped:
+                group_series = group[column].dropna()
 
-        outliers[column] = unusual_values.tolist()
+                if len(group_series) < 4:
+                    continue
 
-    insights = []
+                q1 = group_series.quantile(0.25)
+                q3 = group_series.quantile(0.75)
+                iqr = q3 - q1
 
-    for column in numeric_columns:
-        series = df[column].dropna()
+                if iqr == 0:
+                    continue
 
-        if len(series) < 2:
+                lower_bound = q1 - 1.5 * iqr
+                upper_bound = q3 + 1.5 * iqr
+
+                group_mask = (
+                    (group[column] < lower_bound)
+                    | (group[column] > upper_bound)
+                ).fillna(False)
+
+                combined_mask.loc[group.index] = group_mask
+
+            mask = combined_mask
+
+        else:
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+
+            if iqr == 0:
+                continue
+
+            lower_bound = q1 - 1.5 * iqr
+            upper_bound = q3 + 1.5 * iqr
+
+            mask = (
+                (df[column] < lower_bound)
+                | (df[column] > upper_bound)
+            ).fillna(False)
+
+        save_anomalies(
+            column,
+            mask,
+            "statistical",
+        )
+
+    # ------------------------------------------
+    # BUSINESS RULE VALIDATION
+    # ------------------------------------------
+
+    rules = {
+        "customer_age": lambda s: (s < 18) | (s > 100),
+        "unit_price": lambda s: s <= 0,
+        "quantity": lambda s: (s <= 0) | (s > 100),
+        "discount_percent": lambda s: (s < 0) | (s > 100),
+        "total_revenue": lambda s: s < 0,
+        "cost_per_unit": lambda s: s < 0,
+        "total_cost": lambda s: s < 0,
+        "delivery_days": lambda s: (s < 0) | (s > 30),
+        "inventory_stock": lambda s: s < 0,
+        "stock_quantity": lambda s: s < 0,
+    }
+
+    for column, rule in rules.items():
+
+        if column not in df.columns:
             continue
 
-        first = series.iloc[0]
-        last = series.iloc[-1]
+        numeric_series = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
 
-        if first != 0:
-            change = ((last - first) / abs(first)) * 100
+        mask = rule(numeric_series).fillna(False)
 
-            insights.append(
-                f"{column}: the last observed value was "
-                f"{change:.2f}% different from the first observed value. "
-                "This comparison does not necessarily indicate a trend."
-            )
+        save_anomalies(
+            column,
+            mask,
+            "business_rules",
+        )
+
+    # ------------------------------------------
+    # CALCULATION VALIDATION
+    # ------------------------------------------
+
+    def check_formula(name, expected):
+        if name not in df.columns:
+            return
+
+        actual = pd.to_numeric(
+            df[name],
+            errors="coerce",
+        )
+
+        valid = actual.notna() & expected.notna()
+
+        difference = (actual - expected).abs()
+
+        mask = (
+            valid
+            & (difference > CALCULATION_TOLERANCE)
+        ).fillna(False)
+
+        positions = mask[mask].index
+
+        if len(positions) == 0:
+            return
+
+        calculation_errors[name] = {
+            "count": int(len(positions)),
+            "sample": [
+                {
+                    "row": int(index) + 2,
+                    "actual": float(actual.loc[index]),
+                    "expected": float(expected.loc[index]),
+                }
+                for index in positions[:OUTLIER_SAMPLE_SIZE]
+            ],
+        }
+
+    required_revenue = {
+        "unit_price",
+        "quantity",
+        "discount_percent",
+        "total_revenue",
+    }
+
+    if required_revenue.issubset(df.columns):
+
+        expected_revenue = (
+            df["unit_price"]
+            * df["quantity"]
+            * (1 - df["discount_percent"] / 100)
+        )
+
+        check_formula(
+            "total_revenue",
+            expected_revenue,
+        )
+
+    required_cost = {
+        "cost_per_unit",
+        "quantity",
+        "total_cost",
+    }
+
+    if required_cost.issubset(df.columns):
+
+        expected_cost = (
+            df["cost_per_unit"]
+            * df["quantity"]
+        )
+
+        check_formula(
+            "total_cost",
+            expected_cost,
+        )
+
+    required_profit = {
+        "total_revenue",
+        "total_cost",
+        "profit",
+    }
+
+    if required_profit.issubset(df.columns):
+
+        expected_profit = (
+            df["total_revenue"]
+            - df["total_cost"]
+        )
+
+        check_formula(
+            "profit",
+            expected_profit,
+        )
+
+    # ------------------------------------------
+    # INSIGHTS
+    # ------------------------------------------
+
+    insights = []
 
     return {
         "rows": len(df),
@@ -122,4 +357,5 @@ def analyze_csv(file_path: str) -> dict:
             "duplicate_rows": duplicate_rows,
         },
         "outliers": outliers,
+        "calculation_errors": calculation_errors,
     }
