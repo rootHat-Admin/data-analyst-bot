@@ -1,644 +1,140 @@
-import os
-import html
-import tempfile
-import asyncio
-import logging
-import re
-import markdown
-
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.error import (
-    TelegramError,
-    NetworkError,
-    TimedOut,
-    RetryAfter,
-)
-from telegram.request import HTTPXRequest
-
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-from config import TELEGRAM_BOT_TOKEN
-from ai_explainer import explain_analysis
-from visualizer import create_charts
-from analyzer import analyze_csv
-from pdf_report import create_pdf_report
+import pandas as pd
 
 
-# --------------------------------------------------
-# LOGGING
-# --------------------------------------------------
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-logger = logging.getLogger(__name__)
-
-# Prevent HTTP request URLs from exposing the bot token.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-# Chats currently processing a file.
-active_chats = set()
-
-MAX_FILE_SIZE = 15 * 1024 * 1024
-MAX_MESSAGE_LENGTH = 3900
+MAX_ROWS = 100_000
+MAX_COLUMNS = 100
+OUTLIER_SAMPLE_SIZE = 10
 
 
-# --------------------------------------------------
-# MARKDOWN TO TELEGRAM HTML
-# --------------------------------------------------
+def analyze_csv(file_path: str) -> dict:
 
-def markdown_to_telegram_html(text: str) -> str:
-    result = markdown.markdown(
-        text,
-        extensions=["fenced_code", "sane_lists"],
+    # Check the number of columns before loading the full dataset.
+    header = pd.read_csv(
+        file_path,
+        sep=None,
+        engine="python",
+        encoding="utf-8-sig",
+        nrows=0
     )
 
-    result = re.sub(
-        r"<h[1-6]>(.*?)</h[1-6]>",
-        r"<b>\1</b>\n",
-        result,
-        flags=re.DOTALL,
+    if len(header.columns) > MAX_COLUMNS:
+        raise ValueError(
+            f"CSV contains too many columns. "
+            f"Maximum allowed: {MAX_COLUMNS}."
+        )
+
+    # Read only one row above the limit to detect oversized files.
+    df = pd.read_csv(
+        file_path,
+        sep=None,
+        engine="python",
+        encoding="utf-8-sig",
+        nrows=MAX_ROWS + 1
     )
 
-    result = result.replace("<strong>", "<b>")
-    result = result.replace("</strong>", "</b>")
-    result = result.replace("<em>", "<i>")
-    result = result.replace("</em>", "</i>")
+    if df.empty:
+        raise ValueError("The CSV file is empty.")
 
-    result = result.replace("<p>", "")
-    result = result.replace("</p>", "\n\n")
-    result = result.replace("<ul>", "")
-    result = result.replace("</ul>", "")
-    result = result.replace("<ol>", "")
-    result = result.replace("</ol>", "")
-    result = result.replace("<li>", "• ")
-    result = result.replace("</li>", "\n")
-
-    result = re.sub(r"\n{3,}", "\n\n", result)
-
-    return result.strip()
-
-
-# --------------------------------------------------
-# STATUS ANIMATION
-# --------------------------------------------------
-
-async def animate_status(status_message, status):
-    frames = ["◐", "◓", "◑", "◒"]
-    index = 0
-
-    while True:
-        frame = frames[index % len(frames)]
-
-        text = (
-            f"{frame} <b>DATA ANALYST BOT</b>\n\n"
-            f"{status['stage']}"
+    if len(df) > MAX_ROWS:
+        raise ValueError(
+            f"CSV contains too many rows. "
+            f"Maximum allowed: {MAX_ROWS}."
         )
 
-        try:
-            await status_message.edit_text(
-                text,
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError:
-            pass
+    missing_values = int(df.isna().sum().sum())
+    duplicate_rows = int(df.duplicated().sum())
 
-        index += 1
-        await asyncio.sleep(1.5)
+    numeric_columns = df.select_dtypes(
+        include="number"
+    ).columns.tolist()
 
+    statistics = {}
 
-async def stop_animation(task):
-    if task is None:
-        return
+    for column in df.columns:
+        missing = int(df[column].isna().sum())
 
-    task.cancel()
-
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-
-
-# --------------------------------------------------
-# SAFE FILE DOWNLOAD WITH RETRIES
-# --------------------------------------------------
-
-async def download_csv(document, file_path):
-    attempts = 3
-
-    for attempt in range(attempts):
-        try:
-            telegram_file = await document.get_file()
-
-            await telegram_file.download_to_drive(
-                custom_path=file_path
-            )
-
-            return
-
-        except (TimedOut, NetworkError):
-            if os.path.exists(file_path):
-                os.remove(file_path)
-
-            if attempt == attempts - 1:
-                raise
-
-            delay = 2 ** (attempt + 1)
-
-            logger.warning(
-                "Telegram download timed out. "
-                "Retrying in %s seconds. Attempt %s/%s",
-                delay,
-                attempt + 1,
-                attempts,
-            )
-
-            await asyncio.sleep(delay)
-
-
-# --------------------------------------------------
-# TELEGRAM COMMANDS
-# --------------------------------------------------
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.message.reply_text(
-        "👋 Welcome to Data Analyst Bot!\n\n"
-        "Upload a CSV file and I will:\n"
-        "📊 Analyze your data\n"
-        "🔍 Detect unusual values\n"
-        "🤖 Generate AI insights\n"
-        "📈 Create charts\n"
-        "📄 Prepare a PDF report\n\n"
-        "Let's explore your data!"
-    )
-
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.message.reply_text(
-        "📌 HOW TO USE\n\n"
-        "1. Upload a CSV file.\n"
-        "2. Wait while your data is analyzed.\n"
-        "3. Receive your report, charts and PDF.\n\n"
-        "COMMANDS\n"
-        "/start - Start the bot\n"
-        "/help - Show instructions"
-    )
-
-
-# --------------------------------------------------
-# CSV HANDLER
-# --------------------------------------------------
-
-async def handle_csv(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    document = update.message.document
-    chat_id = update.effective_chat.id
-
-    # Validate filename.
-    if (
-        not document.file_name
-        or not document.file_name.lower().endswith(".csv")
-    ):
-        await update.message.reply_text(
-            "⚠️ Please upload a CSV file."
-        )
-        return
-
-    # Validate file size.
-    if document.file_size and document.file_size > MAX_FILE_SIZE:
-        await update.message.reply_text(
-            "⚠️ File too large. Maximum size is 15 MB."
-        )
-        return
-
-    # Prevent simultaneous analysis in the same chat.
-    if chat_id in active_chats:
-        await update.message.reply_text(
-            "⏳ Your previous file is still being analyzed. "
-            "Please wait until it finishes."
-        )
-        return
-
-    active_chats.add(chat_id)
-
-    status_message = None
-    animation_task = None
-
-    file_path = None
-    pdf_path = None
-    chart_paths = []
-
-    current_stage = "download"
-
-    status = {
-        "stage": "📥 Downloading your CSV file..."
-    }
-
-    try:
-        # Create temporary CSV file.
-        with tempfile.NamedTemporaryFile(
-            suffix=".csv",
-            delete=False,
-        ) as temp_file:
-            file_path = temp_file.name
-
-        # Create status message.
-        status_message = await update.message.reply_text(
-            "◐ DATA ANALYST BOT\n\n"
-            "📥 Preparing your file..."
-        )
-
-        animation_task = asyncio.create_task(
-            animate_status(status_message, status)
-        )
-
-        # Download CSV with retry protection.
-        current_stage = "download"
-        status["stage"] = "📥 Downloading your CSV file..."
-
-        await download_csv(document, file_path)
-
-        # ------------------------------------------
-        # CSV ANALYSIS
-        # ------------------------------------------
-
-        current_stage = "csv"
-        status["stage"] = "📊 Analyzing your data..."
-
-        report = await asyncio.to_thread(
-            analyze_csv,
-            file_path,
-        )
-
-        # ------------------------------------------
-        # AI ANALYSIS
-        # ------------------------------------------
-
-        current_stage = "ai"
-        status["stage"] = (
-            "🤖 Generating AI insights...\n"
-            "This may take a little while."
-        )
-
-        try:
-            ai_explanation = await asyncio.wait_for(
-                asyncio.to_thread(
-                    explain_analysis,
-                    report,
-                ),
-                timeout=90,
-            )
-
-        except asyncio.TimeoutError:
-            logger.warning("AI analysis timed out.")
-
-            ai_explanation = (
-                "AI analysis took too long and was skipped. "
-                "The statistical report is still available."
-            )
-
-        except Exception:
-            logger.exception("AI explanation failed.")
-
-            ai_explanation = (
-                "AI analysis is temporarily unavailable. "
-                "The statistical report is still available."
-            )
-
-        # ------------------------------------------
-        # CREATE CHARTS
-        # ------------------------------------------
-
-        current_stage = "charts"
-        status["stage"] = "📈 Creating data visualizations..."
-
-        chart_paths = await asyncio.to_thread(
-            create_charts,
-            file_path,
-            report["numeric_columns"],
-        )
-
-        chart_paths = chart_paths or []
-
-        # ------------------------------------------
-        # CREATE PDF
-        # ------------------------------------------
-
-        current_stage = "pdf"
-        status["stage"] = "📄 Preparing your PDF report..."
-
-        pdf_path = await asyncio.to_thread(
-            create_pdf_report,
-            report,
-            ai_explanation,
-        )
-
-        # ------------------------------------------
-        # BUILD STATISTICAL REPORT
-        # ------------------------------------------
-
-        current_stage = "sending_report"
-
-        quality = report["data_quality"]
-
-        message = (
-            "📊 <b>DATA ANALYSIS REPORT</b>\n\n"
-            f"📁 Rows: {report['rows']}\n"
-            f"📋 Columns: {report['columns']}\n\n"
-            "🔍 <b>DATA QUALITY</b>\n"
-            f"Missing values: {quality['missing_values']}\n"
-            f"Duplicate rows: {quality['duplicate_rows']}\n\n"
-            "📈 <b>NUMERIC STATISTICS</b>\n"
-        )
-
-        for column, stats in report["statistics"].items():
-
-            if "mean" not in stats:
-                continue
-
-            safe_column = html.escape(str(column))
-
-            message += (
-                f"\n<b>{safe_column}</b>\n"
-                f"Mean: {stats['mean']:.2f} | "
-                f"Median: {stats['median']:.2f}\n"
-                f"Min: {stats['min']:.2f} | "
-                f"Max: {stats['max']:.2f}\n"
-            )
-
-        # Outlier summary.
-        outlier_count = sum(
-            len(values)
-            for values in report["outliers"].values()
-        )
-
-        message += (
-            "\n⚠️ <b>ANOMALY DETECTION</b>\n"
-            f"Unusual values found: {outlier_count}\n"
-        )
-
-        # Data insights.
-        message += "\n💡 <b>DATA INSIGHTS</b>\n"
-
-        if report["insights"]:
-            for insight in report["insights"][:3]:
-                message += (
-                    f"• {html.escape(str(insight))}\n"
-                )
-        else:
-            message += "No simple trends detected.\n"
-
-        # Send statistical report.
-        await update.message.reply_text(
-            message[:MAX_MESSAGE_LENGTH],
-            parse_mode=ParseMode.HTML,
-        )
-
-        # ------------------------------------------
-        # SEND AI REPORT
-        # ------------------------------------------
-
-        current_stage = "sending_ai"
-
-        formatted_explanation = markdown_to_telegram_html(
-            ai_explanation
-        )
-
-        await update.message.reply_text(
-            "🤖 <b>AI ANALYSIS</b>\n\n"
-            + formatted_explanation[:MAX_MESSAGE_LENGTH],
-            parse_mode=ParseMode.HTML,
-        )
-
-        # ------------------------------------------
-        # SEND CHARTS
-        # ------------------------------------------
-
-        current_stage = "sending_charts"
-
-        if chart_paths:
-            for chart_path in chart_paths:
-
-                if not os.path.exists(chart_path):
-                    logger.warning(
-                        "Chart file does not exist: %s",
-                        chart_path,
-                    )
-                    continue
-
-                with open(chart_path, "rb") as chart:
-                    await update.message.reply_photo(
-                        photo=chart,
-                    )
-        else:
-            await update.message.reply_text(
-                "ℹ️ No numeric columns available for charts."
-            )
-
-        # ------------------------------------------
-        # SEND PDF
-        # ------------------------------------------
-
-        current_stage = "sending_pdf"
-
-        if pdf_path and os.path.exists(pdf_path):
-            with open(pdf_path, "rb") as pdf:
-                await update.message.reply_document(
-                    document=pdf,
-                    filename="analysis_report.pdf",
-                    caption="📄 Your PDF report is ready!",
-                )
-        else:
-            logger.warning("PDF file was not created.")
-
-        # ------------------------------------------
-        # FINISH
-        # ------------------------------------------
-
-        await stop_animation(animation_task)
-        animation_task = None
-
-        await update.message.reply_text(
-            "✅ <b>ANALYSIS COMPLETE!</b>\n\n"
-            "Your data has been successfully processed.\n"
-            "Thank you for using Data Analyst Bot! 🚀",
-            parse_mode=ParseMode.HTML,
-        )
-
-        # Delete progress message after success.
-        try:
-            await status_message.delete()
-        except TelegramError:
-            logger.warning("Could not delete status message.")
-
-    # ----------------------------------------------
-    # ERROR HANDLING
-    # ----------------------------------------------
-
-    except Exception:
-        logger.exception(
-            "CSV analysis failed at stage: %s",
-            current_stage,
-        )
-
-        await stop_animation(animation_task)
-        animation_task = None
-
-        error_messages = {
-            "download": (
-                "Could not download your file. "
-                "Telegram or your internet connection may be temporarily unavailable. "
-                "Please try again."
-            ),
-            "csv": (
-                "Could not read this CSV file. "
-                "Check its format, encoding and contents."
-            ),
-            "charts": (
-                "Your data was analyzed, but chart generation failed."
-            ),
-            "pdf": (
-                "Your data was analyzed, but PDF generation failed."
-            ),
-            "sending_report": (
-                "Telegram could not send the statistical report."
-            ),
-            "sending_ai": (
-                "The statistical report was sent, but Telegram could not send the AI report."
-            ),
-            "sending_charts": (
-                "The reports were created, but Telegram could not send the charts."
-            ),
-            "sending_pdf": (
-                "The reports were created, but Telegram could not send the PDF."
-            ),
+        column_stats = {
+            "missing": missing,
+            "unique": int(df[column].nunique()),
         }
 
-        error_text = error_messages.get(
-            current_stage,
-            "An unexpected error occurred. Please try again.",
-        )
+        if column in numeric_columns:
+            column_stats.update({
+                "mean": float(df[column].mean()),
+                "median": float(df[column].median()),
+                "min": float(df[column].min()),
+                "max": float(df[column].max()),
+            })
 
-        if current_stage.startswith("sending"):
-            error_text += (
-                "\n\nSome results may already have been delivered."
+        statistics[column] = column_stats
+
+    outliers = {}
+
+    for column in numeric_columns:
+        series = df[column].dropna()
+
+        if len(series) < 4:
+            continue
+
+        Q1 = series.quantile(0.25)
+        Q3 = series.quantile(0.75)
+
+        IQR = Q3 - Q1
+
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+
+        unusual_values = series[
+            (series < lower_bound) |
+            (series > upper_bound)
+        ]
+
+        if len(unusual_values) == 0:
+            continue
+
+        # Keep the row index for each outlier so the exact
+        # record can be located in the original CSV.
+        sample_pairs = [
+            {"row": int(index) + 1, "value": float(value)}
+            for index, value in unusual_values.head(
+                OUTLIER_SAMPLE_SIZE
+            ).items()
+        ]
+
+        outliers[column] = {
+            "count": int(len(unusual_values)),
+            "sample": sample_pairs,
+        }
+
+    insights = []
+
+    for column in numeric_columns:
+        series = df[column].dropna()
+
+        if len(series) < 2:
+            continue
+
+        first = series.iloc[0]
+        last = series.iloc[-1]
+
+        if first != 0:
+            change = ((last - first) / abs(first)) * 100
+
+            insights.append(
+                f"{column}: the last observed value was "
+                f"{change:.2f}% different from the first observed value. "
+                "This comparison does not necessarily indicate a trend."
             )
 
-        if status_message:
-            try:
-                await status_message.edit_text(
-                    "❌ <b>ANALYSIS FAILED</b>\n\n"
-                    + error_text,
-                    parse_mode=ParseMode.HTML,
-                )
-            except TelegramError:
-                logger.warning(
-                    "Could not update the error status message."
-                )
-        else:
-            try:
-                await update.message.reply_text(error_text)
-            except TelegramError:
-                logger.exception(
-                    "Could not send the error message."
-                )
-
-    finally:
-        # Stop animation.
-        await stop_animation(animation_task)
-
-        # Remove temporary files.
-        temporary_files = (
-            [file_path, pdf_path] + list(chart_paths or [])
-        )
-
-        for path in temporary_files:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    logger.exception(
-                        "Could not remove temporary file."
-                    )
-
-        # Release chat lock.
-        active_chats.discard(chat_id)
-
-
-# --------------------------------------------------
-# MAIN
-# --------------------------------------------------
-
-def main():
-
-    if not TELEGRAM_BOT_TOKEN:
-        raise ValueError(
-            "TELEGRAM_BOT_TOKEN is missing. Check your .env file."
-        )
-
-    # Main Telegram API request settings.
-    request = HTTPXRequest(
-        connection_pool_size=20,
-        connect_timeout=30,
-        read_timeout=60,
-        write_timeout=60,
-        pool_timeout=30,
-    )
-
-    # Separate settings for long polling.
-    updates_request = HTTPXRequest(
-        connection_pool_size=2,
-        connect_timeout=30,
-        read_timeout=30,
-        write_timeout=30,
-        pool_timeout=30,
-    )
-
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .request(request)
-        .get_updates_request(updates_request)
-        .build()
-    )
-
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            handle_csv,
-        )
-    )
-
-    logger.info("Data Analyst Bot is running!")
-
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+    return {
+        "rows": len(df),
+        "columns": len(df.columns),
+        "numeric_columns": numeric_columns,
+        "statistics": statistics,
+        "insights": insights,
+        "data_quality": {
+            "missing_values": missing_values,
+            "duplicate_rows": duplicate_rows,
+        },
+        "outliers": outliers,
+    }
